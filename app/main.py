@@ -12,7 +12,7 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import anyio
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -168,17 +168,18 @@ def _dedupe_sources(docs) -> List[SourceDoc]:
 
 
 @app.post("/ask", response_model=AskResponse)
-async def ask(payload: AskRequest):
+async def ask(payload: AskRequest, background_tasks: BackgroundTasks):
     t0 = time.perf_counter()
-    chain = get_chain()
+    chain = await anyio.to_thread.run_sync(get_chain)
     active_session_id = payload.session_id or "default"
 
     # ── Check response cache (skip RAG for identical recent queries) ──
     cached = _ask_cache.get(payload.query, active_session_id)
     if cached is not None:
         logger.info("POST /ask cache HIT (%.3fs)", time.perf_counter() - t0)
-        # Still record in history so conversation flow stays consistent
-        add_to_history(
+        # Record in history in the background so response returns immediately
+        background_tasks.add_task(
+            add_to_history,
             user_id=payload.user_id,
             session_id=active_session_id,
             user_msg=payload.query,
@@ -188,7 +189,9 @@ async def ask(payload: AskRequest):
 
     # ── Build chat history from stored conversation ──
     t_hist = time.perf_counter()
-    raw_history = get_history(user_id=payload.user_id, session_id=active_session_id)
+    raw_history = await anyio.to_thread.run_sync(
+        lambda: get_history(user_id=payload.user_id, session_id=active_session_id)
+    )
     chat_history = format_chat_history(
         [{"role": m.role, "content": m.content} for m in raw_history],
         max_turns=settings.chat_history_turns,
@@ -217,10 +220,10 @@ async def ask(payload: AskRequest):
                 if s.article_number:
                     s.article_number = convert_to_eastern_arabic(s.article_number)
 
-    # Build serializable raw dict (omit Document objects)
-    safe_raw = {k: v for k, v in result.items() if k not in ("context",)}
+    # Build serializable raw dict (omit Document objects and non-serializable fields)
+    safe_raw = {k: v for k, v in result.items() if k not in ("context", "chat_history")}
 
-    # ── Store in cache + history ──
+    # ── Store in cache ──
     cache_payload = {
         "answer": answer,
         "sources": [s.model_dump() for s in sources],
@@ -228,15 +231,17 @@ async def ask(payload: AskRequest):
     }
     _ask_cache.put(payload.query, active_session_id, cache_payload)
 
-    add_to_history(
+    elapsed = time.perf_counter() - t0
+    logger.info("POST /ask completed in %.2fs", elapsed)
+
+    # Record in history in the background
+    background_tasks.add_task(
+        add_to_history,
         user_id=payload.user_id,
         session_id=active_session_id,
         user_msg=payload.query,
         assistant_msg=answer,
     )
-
-    elapsed = time.perf_counter() - t0
-    logger.info("POST /ask completed in %.2fs", elapsed)
 
     return AskResponse(
         answer=answer,

@@ -539,6 +539,14 @@ def build_qa_chain(settings: Settings):
 
     logger.info("✅ System ready!")
 
+    # Warmup: run one dummy rerank pass so the first real request isn't 10x slower
+    try:
+        _warmup_doc = docs[0] if docs else Document(page_content="warmup")
+        compressor.compress_documents([_warmup_doc], "warmup")
+        logger.info("✅ Reranker warmup done")
+    except Exception:
+        logger.debug("Reranker warmup skipped")
+
     # Attach components to the chain for the streaming endpoint
     qa_chain._wakili_retriever = final_retriever
     qa_chain._wakili_llm = llm

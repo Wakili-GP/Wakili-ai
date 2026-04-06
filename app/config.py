@@ -47,7 +47,7 @@ class Settings:
     semantic_k: int = int(os.getenv("SEMANTIC_K", "10"))
     bm25_k: int = int(os.getenv("BM25_K", "10"))
     meta_k: int = int(os.getenv("META_K", "8"))
-    hybrid_top_k: int = int(os.getenv("HYBRID_TOP_K", "7"))
+    hybrid_top_k: int = int(os.getenv("HYBRID_TOP_K", "5"))
     rrf_k: int = int(os.getenv("RRF_K", "60"))
     reranker_top_n: int = int(os.getenv("RERANKER_TOP_N", "3"))
 

@@ -24,7 +24,8 @@ def arabic_tokenize(text: str) -> List[str]:
     Removes diacritics, keeps Arabic letters/spaces, removes stopwords.
     """
     text = re.sub(r"[\u064B-\u065F\u0670]", "", text)      # strip tashkeel
-    text = re.sub(r"[^\u0600-\u06FF\s]", " ", text)        # keep Arabic only
+    text = re.sub(r"[\u0600-\u0605\u060C-\u061F\u0640\u06D4\u06DD-\u06DE]", "", text)  # strip Arabic punctuation
+    text = re.sub(r"[^\u0621-\u064A\u0671-\u06D3\s]", " ", text)  # keep Arabic letters only
     tokens = text.split()
     return [t for t in tokens if t not in _ARABIC_STOPWORDS and len(t) > 1]
 
