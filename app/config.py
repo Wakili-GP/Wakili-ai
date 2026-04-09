@@ -16,6 +16,15 @@ def _parse_origins(value: str) -> List[str]:
     return [origin.strip() for origin in value.split(",") if origin.strip()]
 
 
+def _parse_bool(value: str, default: bool = False) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if not normalized:
+        return default
+    return normalized in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     base_dir: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -65,6 +74,17 @@ class Settings:
 
     # Chat history depth
     chat_history_turns: int = int(os.getenv("CHAT_HISTORY_TURNS", "3"))
+    history_max_messages: int = int(os.getenv("HISTORY_MAX_MESSAGES", "50"))
+    history_session_limit: int = int(os.getenv("HISTORY_SESSION_LIMIT", "200"))
+    history_summary_enabled: bool = _parse_bool(
+        os.getenv("HISTORY_SUMMARY_ENABLED", "true"),
+        default=True,
+    )
+    history_summary_trigger_messages: int = int(
+        os.getenv("HISTORY_SUMMARY_TRIGGER_MESSAGES", "16")
+    )
+    history_recent_messages: int = int(os.getenv("HISTORY_RECENT_MESSAGES", "8"))
+    history_summary_max_chars: int = int(os.getenv("HISTORY_SUMMARY_MAX_CHARS", "1850"))
 
     # Response cache (in-memory; avoids re-running RAG for identical queries)
     response_cache_maxsize: int = int(os.getenv("RESPONSE_CACHE_MAXSIZE", "128"))

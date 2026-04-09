@@ -10,7 +10,7 @@
 Client (React / Postman)
     │
     ▼
-FastAPI   ──►  /session   →  session_id + user_id
+FastAPI   ──►  /session   →  session_id + ask payload template
     │
     ▼
 POST /ask ──►  Hybrid Retriever (Semantic ∥ BM25 ∥ Metadata)
@@ -48,9 +48,9 @@ POST /ask ──►  Hybrid Retriever (Semantic ∥ BM25 ∥ Metadata)
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
-| `POST` | `/session` | Create a new session (returns `session_id` + `user_id`) |
+| `POST` | `/session` | Create a new session (returns `session_id` + optional `/ask` template) |
 | `POST` | `/ask` | Ask a legal question (RAG pipeline) |
-| `GET` | `/history` | Get conversation history (`?user_id=...&session_id=...`) |
+| `GET` | `/history` | Get conversation history (`?session_id=...`) |
 | `POST` | `/clear-history` | Clear conversation history |
 | `POST` | `/reload` | Rebuild RAG chain + clear response cache |
 | `GET` | `/docs` | Interactive Swagger UI |
@@ -59,11 +59,19 @@ POST /ask ──►  Hybrid Retriever (Semantic ∥ BM25 ∥ Metadata)
 ### `POST /session`
 
 ```json
-// Request (all fields optional)
-{ "user_id": "optional-existing-id" }
+// Request (optional)
+{ "include_ask_template": true }
 
 // Response
-{ "session_id": "sess_...", "user_id": "user_..." }
+{
+  "session_id": "sess_...",
+  "ask_payload_template": {
+    "query": "اكتب سؤالك القانوني هنا",
+    "session_id": "sess_...",
+    "include_sources": true,
+    "eastern_arabic_numerals": false
+  }
+}
 ```
 
 ### `POST /ask`
@@ -72,7 +80,6 @@ POST /ask ──►  Hybrid Retriever (Semantic ∥ BM25 ∥ Metadata)
 // Request
 {
   "query": "ما هي حقوق العامل في قانون العمل؟",
-  "user_id": "user_abc",
   "session_id": "sess_xyz",
   "include_sources": true,
   "eastern_arabic_numerals": false
@@ -81,7 +88,6 @@ POST /ask ──►  Hybrid Retriever (Semantic ∥ BM25 ∥ Metadata)
 // Response
 {
   "answer": "...",
-  "user_id": "user_abc",
   "session_id": "sess_xyz",
   "sources": [
     {
@@ -117,11 +123,19 @@ The `/ask` endpoint goes through: **3 parallel retrievers → RRF fusion → Cro
 
 ### What speeds things up
 
-- **Response cache** — identical `(query, session_id)` pairs hit cache (<5 ms) for 5 minutes
+- **Response cache** — identical `(query, session_id, include_sources, eastern_arabic_numerals)` pairs hit cache (<5 ms) for 5 minutes
 - **Global thread pool** — 3 retrievers run in parallel without per-request pool overhead
 - **Document truncation** — long articles are trimmed to 1 200 chars before entering LLM context
 - **Lower K values** — fewer candidates through the expensive reranker
 - **Lower max_tokens / LLM timeout** — LLM generates and fails faster
+- **Hybrid memory** — older turns are summarized while recent turns remain exact, reducing token cost in long chats
+
+### History strategy (implemented)
+
+- Current implementation: hybrid memory = rolling summary for older turns + exact recent turns.
+- Rollup behavior: when message count crosses the summary trigger, the oldest turns are folded into a compact summary.
+- Prompt behavior: `/ask` sends the summary first, then recent full turns, then the new user question.
+- Benefit: keeps legal context over long sessions with lower token usage and better latency stability.
 
 ---
 
@@ -171,6 +185,12 @@ RERANKER_MODEL_PATH=            # local tokenizer dir; weights from HF cache
 # History backend
 HISTORY_BACKEND=memory          # or "modal_dict" on Modal
 HISTORY_MODAL_DICT_NAME=wakili-history
+HISTORY_MAX_MESSAGES=50         # max stored messages per session (auto-adjusted to even)
+HISTORY_SESSION_LIMIT=200       # in-memory backend: max active sessions before LRU eviction
+HISTORY_SUMMARY_ENABLED=true
+HISTORY_SUMMARY_TRIGGER_MESSAGES=16
+HISTORY_RECENT_MESSAGES=8
+HISTORY_SUMMARY_MAX_CHARS=1850
 
 # Retrieval tuning
 SEMANTIC_K=10

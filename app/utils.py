@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import re
-from typing import List, Set, Tuple
+from typing import Any, List, Set, Tuple
 
 from langchain_core.messages import HumanMessage, AIMessage
 
@@ -39,17 +39,31 @@ def convert_to_eastern_arabic(text: str) -> str:
     return text.translate(str.maketrans(western, eastern))
 
 
+def _message_parts(message: Any) -> Tuple[str, str]:
+    if isinstance(message, dict):
+        return str(message.get("role", "")), str(message.get("content", ""))
+    return str(getattr(message, "role", "")), str(getattr(message, "content", ""))
+
+
 def format_chat_history(messages: list, max_turns: int = 3) -> List:
     """Last *max_turns* Q&A pairs → [HumanMessage, AIMessage, …] for LangChain prompt."""
+    if max_turns <= 0:
+        return []
+
     pairs: List[Tuple[str, str]] = []
     i = 0
     while i < len(messages):
-        if messages[i].get("role") == "user":
-            user_msg = messages[i]["content"]
+        role, content = _message_parts(messages[i])
+        if role == "user":
+            user_msg = content
             ai_msg = ""
-            if i + 1 < len(messages) and messages[i + 1].get("role") == "assistant":
-                ai_msg = messages[i + 1]["content"]
-                i += 2
+            if i + 1 < len(messages):
+                next_role, next_content = _message_parts(messages[i + 1])
+                if next_role == "assistant":
+                    ai_msg = next_content
+                    i += 2
+                else:
+                    i += 1
             else:
                 i += 1
             pairs.append((user_msg, ai_msg))

@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -15,11 +16,13 @@ import anyio
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from langchain_core.messages import AIMessage
 
 from .config import settings
 from .deps import get_chain, reload_chain
-from .history import add_to_history, clear_history, get_history
+from .history import add_to_history, clear_history, get_history, get_history_with_summary
 from .schemas import (
+    AskPayloadTemplate,
     AskRequest,
     AskResponse,
     ClearHistoryResponse,
@@ -42,33 +45,58 @@ class _ResponseCache:
     def __init__(self, maxsize: int = 128, ttl: int = 300):
         self._maxsize = maxsize
         self._ttl = ttl                         # seconds
+        self._lock = threading.RLock()
         self._cache: OrderedDict[str, Tuple[float, Dict[str, Any]]] = OrderedDict()
 
     @staticmethod
-    def _key(query: str, session_id: str) -> str:
-        return hashlib.md5(f"{query}||{session_id}".encode()).hexdigest()
+    def _key(
+        query: str,
+        session_id: str,
+        include_sources: bool,
+        eastern_arabic_numerals: bool,
+    ) -> str:
+        key_raw = (
+            f"{query}||{session_id}||{int(include_sources)}||{int(eastern_arabic_numerals)}"
+        )
+        return hashlib.md5(key_raw.encode()).hexdigest()
 
-    def get(self, query: str, session_id: str) -> Optional[Dict[str, Any]]:
-        k = self._key(query, session_id)
-        entry = self._cache.get(k)
-        if entry is None:
-            return None
-        ts, data = entry
-        if time.time() - ts > self._ttl:
-            self._cache.pop(k, None)
-            return None
-        self._cache.move_to_end(k)
-        return data
+    def get(
+        self,
+        query: str,
+        session_id: str,
+        include_sources: bool,
+        eastern_arabic_numerals: bool,
+    ) -> Optional[Dict[str, Any]]:
+        k = self._key(query, session_id, include_sources, eastern_arabic_numerals)
+        with self._lock:
+            entry = self._cache.get(k)
+            if entry is None:
+                return None
+            ts, data = entry
+            if time.time() - ts > self._ttl:
+                self._cache.pop(k, None)
+                return None
+            self._cache.move_to_end(k)
+            return data
 
-    def put(self, query: str, session_id: str, data: Dict[str, Any]) -> None:
-        k = self._key(query, session_id)
-        self._cache[k] = (time.time(), data)
-        self._cache.move_to_end(k)
-        while len(self._cache) > self._maxsize:
-            self._cache.popitem(last=False)
+    def put(
+        self,
+        query: str,
+        session_id: str,
+        include_sources: bool,
+        eastern_arabic_numerals: bool,
+        data: Dict[str, Any],
+    ) -> None:
+        k = self._key(query, session_id, include_sources, eastern_arabic_numerals)
+        with self._lock:
+            self._cache[k] = (time.time(), data)
+            self._cache.move_to_end(k)
+            while len(self._cache) > self._maxsize:
+                self._cache.popitem(last=False)
 
     def clear(self) -> None:
-        self._cache.clear()
+        with self._lock:
+            self._cache.clear()
 
 
 _ask_cache = _ResponseCache(
@@ -105,10 +133,17 @@ def _startup():
 
 @app.post("/session", response_model=SessionResponse)
 def create_session(payload: SessionRequest = SessionRequest()):
-    """Frontend calls this to get a new session_id (and optionally a user_id)."""
-    user_id = payload.user_id or f"user_{uuid.uuid4().hex[:12]}"
+    """Frontend calls this to get a new session_id and an optional /ask template."""
     session_id = f"sess_{uuid.uuid4().hex}"
-    return SessionResponse(session_id=session_id, user_id=user_id)
+    ask_template = None
+    if payload.include_ask_template:
+        ask_template = AskPayloadTemplate(
+            query="اكتب سؤالك القانوني هنا",
+            session_id=session_id,
+            include_sources=True,
+            eastern_arabic_numerals=False,
+        )
+    return SessionResponse(session_id=session_id, ask_payload_template=ask_template)
 
 
 # ─── Health & maintenance ────────────────────────────────────────
@@ -128,15 +163,15 @@ def reload():
 # ─── History ─────────────────────────────────────────────────────
 
 @app.get("/history", response_model=HistoryResponse)
-def history(user_id: str, session_id: str = "default"):
-    messages = get_history(user_id=user_id, session_id=session_id)
-    return HistoryResponse(user_id=user_id, session_id=session_id, history=messages)
+def history(session_id: str):
+    messages = get_history(session_id=session_id)
+    return HistoryResponse(session_id=session_id, history=messages)
 
 
 @app.post("/clear-history", response_model=ClearHistoryResponse)
-def clear(user_id: str, session_id: str = "default"):
-    clear_history(user_id=user_id, session_id=session_id)
-    return ClearHistoryResponse(user_id=user_id, session_id=session_id, cleared=True)
+def clear(session_id: str):
+    clear_history(session_id=session_id)
+    return ClearHistoryResponse(session_id=session_id, cleared=True)
 
 
 # ─── Ask (RAG) ───────────────────────────────────────────────────
@@ -171,31 +206,40 @@ def _dedupe_sources(docs) -> List[SourceDoc]:
 async def ask(payload: AskRequest, background_tasks: BackgroundTasks):
     t0 = time.perf_counter()
     chain = await anyio.to_thread.run_sync(get_chain)
-    active_session_id = payload.session_id or "default"
+    active_session_id = payload.session_id
 
     # ── Check response cache (skip RAG for identical recent queries) ──
-    cached = _ask_cache.get(payload.query, active_session_id)
+    cached = _ask_cache.get(
+        payload.query,
+        active_session_id,
+        payload.include_sources,
+        payload.eastern_arabic_numerals,
+    )
     if cached is not None:
         logger.info("POST /ask cache HIT (%.3fs)", time.perf_counter() - t0)
         # Record in history in the background so response returns immediately
         background_tasks.add_task(
             add_to_history,
-            user_id=payload.user_id,
             session_id=active_session_id,
             user_msg=payload.query,
             assistant_msg=cached["answer"],
         )
-        return AskResponse(**cached, user_id=payload.user_id, session_id=active_session_id)
+        return AskResponse(**cached, session_id=active_session_id)
 
     # ── Build chat history from stored conversation ──
     t_hist = time.perf_counter()
-    raw_history = await anyio.to_thread.run_sync(
-        lambda: get_history(user_id=payload.user_id, session_id=active_session_id)
-    )
-    chat_history = format_chat_history(
-        [{"role": m.role, "content": m.content} for m in raw_history],
-        max_turns=settings.chat_history_turns,
-    )
+    chat_history = []
+    if settings.chat_history_turns > 0 or settings.history_summary_enabled:
+        raw_history, history_summary = await anyio.to_thread.run_sync(
+            lambda: get_history_with_summary(session_id=active_session_id)
+        )
+        if settings.chat_history_turns > 0:
+            chat_history = format_chat_history(raw_history, max_turns=settings.chat_history_turns)
+        if settings.history_summary_enabled and history_summary:
+            chat_history.insert(
+                0,
+                AIMessage(content=f"Summary of older conversation turns:\n{history_summary}"),
+            )
     logger.info("  history: %.3fs", time.perf_counter() - t_hist)
 
     # ── RAG pipeline (retrieval + reranking + LLM) ──
@@ -229,7 +273,13 @@ async def ask(payload: AskRequest, background_tasks: BackgroundTasks):
         "sources": [s.model_dump() for s in sources],
         "raw": safe_raw,
     }
-    _ask_cache.put(payload.query, active_session_id, cache_payload)
+    _ask_cache.put(
+        payload.query,
+        active_session_id,
+        payload.include_sources,
+        payload.eastern_arabic_numerals,
+        cache_payload,
+    )
 
     elapsed = time.perf_counter() - t0
     logger.info("POST /ask completed in %.2fs", elapsed)
@@ -237,7 +287,6 @@ async def ask(payload: AskRequest, background_tasks: BackgroundTasks):
     # Record in history in the background
     background_tasks.add_task(
         add_to_history,
-        user_id=payload.user_id,
         session_id=active_session_id,
         user_msg=payload.query,
         assistant_msg=answer,
@@ -245,7 +294,6 @@ async def ask(payload: AskRequest, background_tasks: BackgroundTasks):
 
     return AskResponse(
         answer=answer,
-        user_id=payload.user_id,
         session_id=active_session_id,
         sources=sources,
         raw=safe_raw,
