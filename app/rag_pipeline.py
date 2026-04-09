@@ -7,7 +7,6 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import threading
 import time
 import warnings
@@ -42,9 +41,7 @@ logging.basicConfig(level=logging.INFO)
 
 # Global caches for heavy resources
 _embeddings_cache = None
-_vectorstore_cache = None
 _cross_encoder_cache = None
-_docs_cache = None
 _cache_lock = threading.RLock()
 
 # Reusable thread pool for parallel retrieval (avoids per-request overhead)
@@ -52,6 +49,7 @@ _retrieval_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="retrieva
 
 # Max characters per document sent to LLM context (keeps prompt tight)
 _MAX_DOC_CHARS = 1200
+_VECTOR_SYNC_BATCH_SIZE = 256
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -176,6 +174,99 @@ def _load_json_folder(folder_path: str) -> List[dict]:
     return all_items
 
 
+def _stable_item_key(item: dict) -> str:
+    """Build a deterministic key for each legal article across reloads."""
+    article_id = str(item.get("article_id", "")).strip()
+    if article_id:
+        return article_id
+
+    law_name = str(item.get("law_name") or item.get("_law_name") or "").strip()
+    article_number = str(item.get("article_number", "")).strip()
+    if law_name or article_number:
+        return f"{law_name}::{article_number}"
+
+    return hashlib.md5(json.dumps(item, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _vector_id_for_item(item_key: str) -> str:
+    return f"art_{hashlib.md5(item_key.encode('utf-8')).hexdigest()}"
+
+
+def _doc_hash(page_content: str, metadata: Dict[str, str]) -> str:
+    payload = {
+        "page_content": page_content,
+        "article_id": metadata.get("article_id", ""),
+        "article_number": metadata.get("article_number", ""),
+        "law_name": metadata.get("law_name", ""),
+        "legal_nature": metadata.get("legal_nature", ""),
+        "keywords": metadata.get("keywords", ""),
+        "part": metadata.get("part", ""),
+        "chapter": metadata.get("chapter", ""),
+    }
+    return hashlib.md5(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _iter_chunks(items: List[str], chunk_size: int):
+    for i in range(0, len(items), chunk_size):
+        yield items[i : i + chunk_size]
+
+
+def _existing_hashes_by_vector_id(vectorstore: Chroma) -> Dict[str, str]:
+    """Read current IDs + doc hashes from Chroma to compute an incremental diff."""
+    try:
+        snapshot = vectorstore.get(include=["metadatas"])
+    except Exception:
+        return {}
+
+    ids = snapshot.get("ids") or []
+    metadatas = snapshot.get("metadatas") or []
+
+    existing: Dict[str, str] = {}
+    for idx, vector_id in enumerate(ids):
+        metadata = metadatas[idx] if idx < len(metadatas) and isinstance(metadatas[idx], dict) else {}
+        existing[str(vector_id)] = str(metadata.get("_doc_hash", "") or "")
+    return existing
+
+
+def _sync_vectorstore_incremental(vectorstore: Chroma, docs_by_vector_id: Dict[str, Document]) -> None:
+    """Add/update/delete only changed vectors instead of rebuilding the full store."""
+    existing_hashes = _existing_hashes_by_vector_id(vectorstore)
+    target_hashes = {
+        vector_id: str(doc.metadata.get("_doc_hash", "") or "")
+        for vector_id, doc in docs_by_vector_id.items()
+    }
+
+    to_delete = [vid for vid in existing_hashes if vid not in target_hashes]
+    to_add = [vid for vid in target_hashes if vid not in existing_hashes]
+    to_reindex = [
+        vid
+        for vid in target_hashes
+        if vid in existing_hashes and existing_hashes[vid] != target_hashes[vid]
+    ]
+
+    if to_delete:
+        for chunk in _iter_chunks(to_delete, _VECTOR_SYNC_BATCH_SIZE):
+            vectorstore.delete(ids=chunk)
+
+    if to_reindex:
+        for chunk in _iter_chunks(to_reindex, _VECTOR_SYNC_BATCH_SIZE):
+            vectorstore.delete(ids=chunk)
+
+    to_upsert = to_add + to_reindex
+    if to_upsert:
+        for chunk_ids in _iter_chunks(to_upsert, _VECTOR_SYNC_BATCH_SIZE):
+            chunk_docs = [docs_by_vector_id[vid] for vid in chunk_ids]
+            vectorstore.add_documents(documents=chunk_docs, ids=chunk_ids)
+
+    logger.info(
+        "✅ Chroma sync: +%d ~%d -%d (total=%d)",
+        len(to_add),
+        len(to_reindex),
+        len(to_delete),
+        len(target_hashes),
+    )
+
+
 def build_qa_chain(settings: Settings):
     """
     Builds and returns qa_chain accepting:
@@ -188,18 +279,15 @@ def build_qa_chain(settings: Settings):
 
     data = _load_json_folder(settings.data_dir)
 
-    # De-duplicate by article_id (md5 fallback for items without an ID)
+    # De-duplicate by stable key so reloads produce deterministic vector IDs.
     unique: Dict[str, dict] = {}
     for item in data:
-        key = str(
-            item.get("article_id")
-            or item.get("article_number")
-            or hashlib.md5(json.dumps(item, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-        )
+        key = _stable_item_key(item)
         unique[key] = item
     data = list(unique.values())
 
     docs: List[Document] = []
+    vector_ids: List[str] = []
     for item in data:
         article_number = item.get("article_number")
         original_text = item.get("original_text")
@@ -222,6 +310,9 @@ def build_qa_chain(settings: Settings):
             f"الشرح المبسط: {simplified_summary}"
         )
 
+        item_key = _stable_item_key(item)
+        vector_id = _vector_id_for_item(item_key)
+
         metadata = {
             "article_id": item.get("article_id") or str(article_number),
             "article_number": str(article_number),
@@ -230,16 +321,22 @@ def build_qa_chain(settings: Settings):
             "keywords": ", ".join(item.get("keywords", []) or []),
             "part": part_bab,
             "chapter": chapter_fasl,
+            "_doc_key": item_key,
         }
+        metadata["_doc_hash"] = _doc_hash(page_content=page_content, metadata=metadata)
         docs.append(Document(page_content=page_content, metadata=metadata))
+        vector_ids.append(vector_id)
 
     if not docs:
         raise RuntimeError("No valid documents found in data folder (missing required fields).")
 
     logger.info("✅ %d legal articles loaded", len(docs))
+    docs_by_vector_id: Dict[str, Document] = {
+        vid: doc for vid, doc in zip(vector_ids, docs)
+    }
 
     # Cache heavy resources globally
-    global _embeddings_cache, _vectorstore_cache, _cross_encoder_cache, _docs_cache
+    global _embeddings_cache, _cross_encoder_cache
     
     with _cache_lock:
         # Load embeddings (cached)
@@ -251,41 +348,13 @@ def build_qa_chain(settings: Settings):
                 cache_folder=settings.embedding_cache_dir,
             )
         embeddings = _embeddings_cache
-        
-        # Cache docs for reuse
-        if _docs_cache is None or len(_docs_cache) != len(docs):
-            _docs_cache = docs
-        docs = _docs_cache
 
-    # vector store reuse (with global cache)
-    with _cache_lock:
-        if _vectorstore_cache is not None:
-            vectorstore = _vectorstore_cache
-        else:
-            db_exists = os.path.exists(settings.chroma_dir) and os.listdir(settings.chroma_dir)
-            if db_exists:
-                vectorstore = Chroma(
-                    persist_directory=settings.chroma_dir,
-                    embedding_function=embeddings,
-                )
-                stored_count = vectorstore._collection.count()
-                if stored_count == 0 or abs(stored_count - len(docs)) > 5:
-                    logger.warning("Count mismatch (%d vs %d). Rebuilding...", stored_count, len(docs))
-                    shutil.rmtree(settings.chroma_dir, ignore_errors=True)
-                    db_exists = False
-                else:
-                    logger.info("✅ Chroma DB loaded (%d vectors)", stored_count)
-
-            if not db_exists:
-                logger.info("Building Chroma DB (first run for this model)...")
-                vectorstore = Chroma.from_documents(
-                    docs,
-                    embeddings,
-                    persist_directory=settings.chroma_dir,
-                )
-                logger.info("✅ Chroma DB built (%d vectors)", len(docs))
-            
-            _vectorstore_cache = vectorstore
+    os.makedirs(settings.chroma_dir, exist_ok=True)
+    vectorstore = Chroma(
+        persist_directory=settings.chroma_dir,
+        embedding_function=embeddings,
+    )
+    _sync_vectorstore_incremental(vectorstore=vectorstore, docs_by_vector_id=docs_by_vector_id)
 
     base_retriever = vectorstore.as_retriever(search_kwargs={"k": settings.semantic_k})
 

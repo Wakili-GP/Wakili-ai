@@ -52,7 +52,7 @@ POST /ask ──►  Hybrid Retriever (Semantic ∥ BM25 ∥ Metadata)
 | `POST` | `/ask` | Ask a legal question (RAG pipeline) |
 | `GET` | `/history` | Get conversation history (`?session_id=...`) |
 | `POST` | `/clear-history` | Clear conversation history |
-| `POST` | `/reload` | Rebuild RAG chain + clear response cache |
+| `POST` | `/reload` | Reload chain + incremental vector sync + clear response cache |
 | `GET` | `/docs` | Interactive Swagger UI |
 | `GET` | `/redoc` | ReDoc documentation |
 
@@ -124,6 +124,7 @@ The `/ask` endpoint goes through: **3 parallel retrievers → RRF fusion → Cro
 ### What speeds things up
 
 - **Response cache** — identical `(query, session_id, include_sources, eastern_arabic_numerals)` pairs hit cache (<5 ms) for 5 minutes
+- **Incremental Chroma sync on reload** — only added/changed/removed legal articles are re-embedded
 - **Global thread pool** — 3 retrievers run in parallel without per-request pool overhead
 - **Document truncation** — long articles are trimmed to 1 200 chars before entering LLM context
 - **Lower K values** — fewer candidates through the expensive reranker
