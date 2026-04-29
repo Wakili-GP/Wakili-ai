@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
-<<<<<<< Updated upstream
+
 class Message(BaseModel):
     role: str = Field(..., description="'user' or 'assistant'")
     content: str = Field(..., description="Message content")
@@ -18,7 +18,7 @@ class AskRequest(BaseModel):
         default=False, description="Convert digits 0-9 to Eastern Arabic numerals"
     )
 
-=======
+
 class SessionResponse(BaseModel):
     session_id: str
 
@@ -48,7 +48,7 @@ class Message(BaseModel):
     content: str = Field(..., min_length=1, description="Message text")
     sources: Optional[List[dict]] = None
 
->>>>>>> Stashed changes
+
 
 class SourceDoc(BaseModel):
     article_id: Optional[str] = None
@@ -61,13 +61,12 @@ class SourceDoc(BaseModel):
     page_content: str
 
 
-<<<<<<< Updated upstream
+
 class AskResponse(BaseModel):
     answer: str
     sources: List[SourceDoc] = Field(default_factory=list)
     session_id: str
     raw: Dict[str, Any] = Field(default_factory=dict)
-=======
 
 
 class HistoryResponse(BaseModel):
@@ -78,4 +77,3 @@ class HistoryResponse(BaseModel):
 class ClearHistoryResponse(BaseModel):
     session_id: str
     cleared: bool = True
->>>>>>> Stashed changes
