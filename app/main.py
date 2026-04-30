@@ -85,11 +85,14 @@ _ask_cache = _ResponseCache(
 
 app = FastAPI(title="Legal RAG API", version="2.0.0")
 
-allow_any_origin = "*" in settings.cors_allowed_origins
+from fastapi.middleware.cors import CORSMiddleware
+
+
+# Adding middlware to solve the CORS problem for me
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_allowed_origins,
-    allow_credentials=not allow_any_origin,
+    allow_origins=["https://www.wakili.me/"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
