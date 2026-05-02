@@ -30,7 +30,6 @@ from .history import (
 from .schemas import (
     AskRequest,
     ClearHistoryResponse,
-    HistoryResponse,
     SessionResponse,
     SourceDoc,
 )
@@ -131,10 +130,42 @@ def reload():
     return {"status": "reloaded"}
 
 
-@app.get("/history", response_model=HistoryResponse)
+@app.get("/history")
 def history(session_id: str):
-    messages = get_history(session_id=session_id)
-    return HistoryResponse(session_id=session_id, history=messages)
+    from .database import _init_db, SessionLocal as LazySession
+    _init_db()
+    db = LazySession()
+    try:
+        logs = (
+            db.query(ChatLog)
+            .filter(ChatLog.session_id == session_id)
+            .order_by(ChatLog.asked_at.asc())
+            .all()
+        )
+
+        messages = []
+        for log in logs:
+            messages.append({"role": "user", "content": log.question})
+            messages.append({"role": "assistant", "content": log.response})
+
+        return {
+            "success": True,
+            "statusCode": 200,
+            "error": None,
+            "data": {
+                "session_id": session_id,
+                "history": messages
+            }
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "statusCode": 500,
+            "error": str(e),
+            "data": None
+        }
+    finally:
+        db.close()
 
 
 @app.post("/clear-history", response_model=ClearHistoryResponse)
