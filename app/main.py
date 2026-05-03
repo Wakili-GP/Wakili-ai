@@ -20,6 +20,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import AIMessage
 
 from .config import settings
+
+from pydantic import BaseModel
+
+
 from .deps import get_chain, reload_chain
 from .history import (
     add_to_history,
@@ -32,12 +36,14 @@ from .schemas import (
     ClearHistoryResponse,
     SessionResponse,
     SourceDoc,
+    UpdateTitleRequest,
 )
 from .utils import convert_to_eastern_arabic, format_chat_history
 
 logger = logging.getLogger(__name__)
 
-
+class UpdateTitleRequest(BaseModel):
+    new_title: str
 # Response Cache
 class _ResponseCache:
     def __init__(self, maxsize: int = 128, ttl: int = 300):
@@ -112,22 +118,45 @@ def _startup():
             logger.warning(f"Chain preload failed: {e}")
 
 
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 @app.post("/session", response_model=SessionResponse)
 def create_session():
     session_id = f"sess_{uuid.uuid4().hex}"
     return SessionResponse(session_id=session_id)
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+@app.get("/sessions")
+def get_chat_sessions(user_id: str):
+    from .database import _init_db, SessionLocal as LazySession
+    _init_db()
+    db = LazySession()
+    try:
+        logs = db.query(ChatLog).filter(ChatLog.user_id == user_id).order_by(ChatLog.asked_at.asc()).all()
+        sessions = {}
+        for log in logs:
+            sid = log.session_id
+            if sid not in sessions:
+                sessions[sid] = {
+                    "session_id": sid,
+                    "title": log.title if log.title else log.question[:50],
+                    "last_message": log.response,
+                    "updated_at": log.asked_at.isoformat(),
+                }
+            else:
+                sessions[sid]["last_message"] = log.response
+                sessions[sid]["updated_at"] = log.asked_at.isoformat(),
+        return {"success": True, "data": list(sessions.values()), "error": None, "statusCode": 200}
+    except Exception as e:
+        return {"success": False, "data": None, "error": str(e), "statusCode": 500}
+    finally:
+        db.close()
 
 
-@app.post("/reload")
-def reload():
-    reload_chain()
-    _ask_cache.clear()
-    return {"status": "reloaded"}
+
 
 
 @app.get("/history")
@@ -145,8 +174,15 @@ def history(session_id: str):
 
         messages = []
         for log in logs:
-            messages.append({"role": "user", "content": log.question})
-            messages.append({"role": "assistant", "content": log.response})
+            messages.append({
+                "role": "user",
+                "content": log.question
+            })
+            messages.append({
+                "role": "assistant",
+                "content": log.response,
+                "sources": log.sources or []  # ← add this
+            })
 
         return {
             "success": True,
@@ -168,38 +204,9 @@ def history(session_id: str):
         db.close()
 
 
-@app.post("/clear-history", response_model=ClearHistoryResponse)
-def clear(session_id: str):
-    clear_history(session_id=session_id)
-    return ClearHistoryResponse(session_id=session_id, cleared=True)
 
 
-@app.get("/chat-sessions")
-def get_chat_sessions(user_id: str):
-    from .database import _init_db, SessionLocal as LazySession
-    _init_db()
-    db = LazySession()
-    try:
-        logs = db.query(ChatLog).filter(ChatLog.user_id == user_id).order_by(ChatLog.asked_at.asc()).all()
-        sessions = {}
-        for log in logs:
-            sid = log.session_id
-            if sid not in sessions:
-                sessions[sid] = {
-                    "session_id": sid,
-                    "title": log.question[:50],
-                    "created_at": log.asked_at.isoformat(),
-                    "last_message": log.response,
-                    "updated_at": log.asked_at.isoformat(),
-                }
-            else:
-                sessions[sid]["last_message"] = log.response
-                sessions[sid]["updated_at"] = log.asked_at.isoformat()
-        return {"success": True, "data": list(sessions.values()), "error": None, "statusCode": 200}
-    except Exception as e:
-        return {"success": False, "data": None, "error": str(e), "statusCode": 500}
-    finally:
-        db.close()
+
 
 
 def _dedupe_sources(docs) -> List[SourceDoc]:
@@ -226,12 +233,18 @@ def _dedupe_sources(docs) -> List[SourceDoc]:
     return out
 
 
-def _save_chat_log(session_id: str, user_id: str, question: str, response: str):
+def _save_chat_log(session_id: str, user_id: str, question: str, response: str, sources: list = []):
     from .database import _init_db, SessionLocal as LazySession
     _init_db()
     db = LazySession()
     try:
-        db.add(ChatLog(user_id=user_id, session_id=session_id, question=question, response=response))
+        db.add(ChatLog(
+            user_id=user_id,
+            session_id=session_id,
+            question=question,
+            response=response,
+            sources=sources,  # ← add this
+        ))
         db.commit()
         logger.info(f"Chat log saved for session {session_id}")
     except Exception as e:
@@ -240,18 +253,36 @@ def _save_chat_log(session_id: str, user_id: str, question: str, response: str):
     finally:
         db.close()
 
+def _normalize_arabic(text: str) -> str:
+    """Normalize Arabic text to avoid encoding mismatches."""
+    # Normalize alef variations (أ إ آ ا → ا)
+    text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    # Normalize teh marbuta (ة → ه)
+    text = text.replace("ة", "ه")
+    # Normalize alef maqsura (ى → ي)
+    text = text.replace("ى", "ي")
+    # Remove tashkeel (diacritics)
+    import re
+    text = re.sub(r'[\u064B-\u065F\u0670]', '', text)
+    # Normalize tatweel
+    text = text.replace("ـ", "")
+    return text
+
 
 _CONVERSATIONAL_PATTERNS = [
-    "ما هو السؤال السابق", "ما سألت", "كررت", "ماذا قلت",
-    "اشرح أكثر", "وضح", "هل يمكنك",
-    "شكرا", "شكراً", "شكرًا",
-    "مرحبا", "مرحباً", "أهلا", "أهلاً",
-    "من أنت", "ما اسمك", "كيف حالك",
+    "ما هو السؤال السابق", "ما سالت", "كررت", "ماذا قلت",
+    "اشرح اكثر", "وضح", "هل يمكنك",
+    "شكرا", "شكران",
+    "مرحبا", "اهلا",
+    "من انت", "ما اسمك", "كيف حالك",
     "مساء", "صباح", "السلام", "هلا",
+    "عرف بنفسك", "من انت", "ايه اسمك",
 ]
 
 def _is_conversational(query: str) -> bool:
-    return any(p in query.strip() for p in _CONVERSATIONAL_PATTERNS)
+    q = _normalize_arabic(query.strip())
+    patterns = [_normalize_arabic(p) for p in _CONVERSATIONAL_PATTERNS]
+    return any(p in q for p in patterns)
 
 def _docs_are_relevant(docs: list) -> bool:
     if not docs:
@@ -272,7 +303,15 @@ async def ask(payload: AskRequest, background_tasks: BackgroundTasks):
     cached = _ask_cache.get(payload.query, session_id, payload.include_sources, payload.eastern_arabic_numerals)
     if cached:
         background_tasks.add_task(add_to_history, session_id=user_session_id, user_msg=payload.query, assistant_msg=cached["answer"])
-        background_tasks.add_task(_save_chat_log, session_id=session_id, user_id=payload.user_id, question=payload.query, response=cached["answer"])
+        background_tasks.add_task(
+        _save_chat_log,
+        session_id=session_id,
+        user_id=payload.user_id,
+        question=payload.query,
+        response=full_answer,
+        sources=[s.model_dump() for s in sources],  
+        )
+    
         return {"success": True, "statusCode": 200, "error": None, "data": {"answer": cached["answer"], "session_id": session_id, "sources": cached["sources"]}}
 
     chat_history = []
@@ -303,8 +342,14 @@ async def ask(payload: AskRequest, background_tasks: BackgroundTasks):
                    {"answer": full_answer, "sources": [s.model_dump() for s in sources], "raw": {}})
 
     background_tasks.add_task(add_to_history, session_id=user_session_id, user_msg=payload.query, assistant_msg=full_answer)
-    background_tasks.add_task(_save_chat_log, session_id=session_id, user_id=payload.user_id, question=payload.query, response=full_answer)
-
+    background_tasks.add_task(
+        _save_chat_log,
+        session_id=session_id,
+        user_id=payload.user_id,
+        question=payload.query,
+        response=full_answer,
+        sources=[s.model_dump() for s in sources],  
+    )
     return {
         "success": True,
         "statusCode": 200,
@@ -315,3 +360,90 @@ async def ask(payload: AskRequest, background_tasks: BackgroundTasks):
             "sources": [s.model_dump() for s in sources],
         }
     }
+
+
+
+
+
+@app.delete("/session/{session_id}")
+def delete_chat_session(session_id: str):
+    from .database import _init_db, SessionLocal as LazySession
+    _init_db()
+    db = LazySession()
+    try:
+        deleted = (
+            db.query(ChatLog)
+            .filter(ChatLog.session_id == session_id)
+            .delete()
+        )
+        db.commit()
+
+        if deleted == 0:
+            return {
+                "success": False,
+                "statusCode": 404,
+                "error": "Session not found",
+                "data": None
+            }
+
+        return {
+            "success": True,
+            "statusCode": 200,
+            "error": None,
+            "data": {"session_id": session_id, "deleted": True}
+        }
+    except Exception as e:
+        db.rollback()
+        return {
+            "success": False,
+            "statusCode": 500,
+            "error": str(e),
+            "data": None
+        }
+    finally:
+        db.close()
+
+
+@app.put("/session/{session_id}")
+def update_chat_title(session_id: str, payload: UpdateTitleRequest):
+    from .database import _init_db, SessionLocal as LazySession
+    _init_db()
+    db = LazySession()
+    try:
+        logs = (
+            db.query(ChatLog)
+            .filter(ChatLog.session_id == session_id)
+            .all()
+        )
+
+        if not logs:
+            return {
+                "success": False,
+                "statusCode": 404,
+                "error": "Session not found",
+                "data": None
+            }
+
+        for log in logs:
+            log.title = payload.new_title
+        db.commit()
+
+        return {
+            "success": True,
+            "statusCode": 200,
+            "error": None,
+            "data": {
+                "session_id": session_id,
+                "title": payload.new_title
+            }
+        }
+    except Exception as e:
+        db.rollback()
+        return {
+            "success": False,
+            "statusCode": 500,
+            "error": str(e),
+            "data": None
+        }
+    finally:
+        db.close()

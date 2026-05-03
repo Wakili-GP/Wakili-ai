@@ -47,3 +47,6 @@ class SourceDoc(BaseModel):
 class ClearHistoryResponse(BaseModel):
     session_id: str
     cleared: bool = True
+
+class UpdateTitleRequest(BaseModel):
+    new_title: str

@@ -5,11 +5,14 @@ from sqlalchemy import create_engine, Column, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 import uuid
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+from datetime import datetime, timezone
+
 
 load_dotenv()
 
 Base = declarative_base()
+
 
 
 class ChatLog(Base):
@@ -18,9 +21,11 @@ class ChatLog(Base):
     id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id    = Column(String, nullable=True)
     session_id = Column(String, nullable=False)
-    asked_at   = Column(DateTime, default=datetime.utcnow)
+    asked_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     question   = Column(Text, nullable=False)
     response   = Column(Text, nullable=False)
+    sources    = Column(JSONB, nullable=True)  
+    title      = Column(String, nullable=True)
 
 # Lazy globals — not created at import time
 engine = None
